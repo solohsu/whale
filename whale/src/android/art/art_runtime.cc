@@ -175,7 +175,11 @@ bool ArtRuntime::OnLoad(JavaVM *vm, JNIEnv *env, jclass java_class) {
     CHECK_FIELD(quick_generic_jni_trampoline, nullptr)
     class_linker_objects_.quick_generic_jni_trampoline_ = quick_generic_jni_trampoline;
 
+    pthread_mutex_init(&mutex, nullptr);
     EnforceDisableHiddenAPIPolicy();
+    if (api_level_ >= ANDROID_N) {
+        FixBugN();
+    }
     return true;
 
 #undef CHECK_OFFSET
@@ -191,9 +195,6 @@ ArtRuntime::HookMethod(JNIEnv *env, jclass decl_class, jobject hooked_java_metho
     ArtMethod hooked_method(hooked_jni_method);
     auto *param = new ArtHookParam();
 
-    param->origin_compiled_code_ = hooked_method.GetEntryPointFromQuickCompiledCode();
-    param->origin_code_item_off = hooked_method.GetDexCodeItemOffset();
-    param->origin_jni_code_ = hooked_method.GetEntryPointFromJni();
     param->class_Loader_ = env->NewGlobalRef(
             env->CallObjectMethod(
                     decl_class,
@@ -203,10 +204,11 @@ ArtRuntime::HookMethod(JNIEnv *env, jclass decl_class, jobject hooked_java_metho
     param->shorty_ = hooked_method.GetShorty(env, hooked_java_method);
     param->is_static_ = hooked_method.HasAccessFlags(kAccStatic);
 
-    if (param->is_static_) {
-        EnsureClassInitialized(env, decl_class);
-    }
-    jobject origin_java_method = hooked_method.Clone(env, hooked_method.GetAccessFlags());
+    param->origin_compiled_code_ = hooked_method.GetEntryPointFromQuickCompiledCode();
+    param->origin_code_item_off = hooked_method.GetDexCodeItemOffset();
+    param->origin_jni_code_ = hooked_method.GetEntryPointFromJni();
+    param->origin_access_flags = hooked_method.GetAccessFlags();
+    jobject origin_java_method = hooked_method.Clone(env, param->origin_access_flags);
 
     ResolvedSymbols *symbols = GetSymbols();
     if (symbols->ProfileSaver_ForceProcessProfiles) {
@@ -269,19 +271,23 @@ ArtRuntime::InvokeOriginalMethod(jlong slot, jobject this_object, jobjectArray a
     ArtMethod hooked_method(param->hooked_native_method_);
     ptr_t decl_class = hooked_method.GetDeclaringClass();
     if (param->decl_class_ != decl_class) {
-        ScopedSuspendAll suspend_all;
-        LOG(INFO)
-                << "Notice: MovingGC cause the GcRoot References changed.";
-        jobject origin_java_method = hooked_method.Clone(env, param->origin_access_flags);
-        jmethodID origin_jni_method = env->FromReflectedMethod(origin_java_method);
-        ArtMethod origin_method(origin_jni_method);
-        origin_method.SetEntryPointFromQuickCompiledCode(param->origin_compiled_code_);
-        origin_method.SetEntryPointFromJni(param->origin_jni_code_);
-        origin_method.SetDexCodeItemOffset(param->origin_code_item_off);
-        param->origin_native_method_ = origin_jni_method;
-        env->DeleteGlobalRef(param->origin_method_);
-        param->origin_method_ = env->NewGlobalRef(origin_java_method);
-        param->decl_class_ = decl_class;
+        pthread_mutex_lock(&mutex);
+        if (param->decl_class_ != decl_class) {
+            ScopedSuspendAll suspend_all;
+            LOG(INFO)
+                    << "Notice: MovingGC cause the GcRoot References changed.";
+            jobject origin_java_method = hooked_method.Clone(env, param->origin_access_flags);
+            jmethodID origin_jni_method = env->FromReflectedMethod(origin_java_method);
+            ArtMethod origin_method(origin_jni_method);
+            origin_method.SetEntryPointFromQuickCompiledCode(param->origin_compiled_code_);
+            origin_method.SetEntryPointFromJni(param->origin_jni_code_);
+            origin_method.SetDexCodeItemOffset(param->origin_code_item_off);
+            param->origin_native_method_ = origin_jni_method;
+            env->DeleteGlobalRef(param->origin_method_);
+            param->origin_method_ = env->NewGlobalRef(origin_java_method);
+            param->decl_class_ = decl_class;
+        }
+        pthread_mutex_unlock(&mutex);
     }
 
     jobject ret = env->CallNonvirtualObjectMethod(
@@ -463,6 +469,26 @@ ptr_t ArtRuntime::CloneArtObject(ptr_t art_object) {
         return symbols->Object_CloneWithClass(art_object, GetCurrentArtThread(), nullptr);
     }
     return symbols->Object_CloneWithSize(art_object, GetCurrentArtThread(), 0);
+}
+
+int (*old_ToDexPc)(void *thiz, void *a2, unsigned int a3, int a4);
+int new_ToDexPc(void *thiz, void *a2, unsigned int a3, int a4) {
+    return old_ToDexPc(thiz, a2, a3, 0);
+}
+
+bool is_hooked = false;
+void ArtRuntime::FixBugN() {
+    if (is_hooked)
+        return;
+    void *symbol = nullptr;
+    symbol = WDynamicLibSymbol(
+            art_elf_image_,
+            "_ZNK3art20OatQuickMethodHeader7ToDexPcEPNS_9ArtMethodEjb"
+    );
+    if (symbol) {
+        WInlineHookFunction(symbol, reinterpret_cast<void *>(new_ToDexPc), reinterpret_cast<void **>(&old_ToDexPc));
+    }
+    is_hooked = true;
 }
 
 }  // namespace art
